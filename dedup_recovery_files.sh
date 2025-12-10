@@ -14,14 +14,16 @@ RECOVERED_DIR="/mnt/recovered_data"
 
 # 存放原始文件模糊哈希索引的路径
 ORIGINAL_HASHES="/tmp/original_hashes.txt"
+# 存放恢复文件模糊哈希索引的路径（可复用以节省重复生成时间）
+RECOVERED_HASHES="/tmp/recovered_hashes.txt"
 
 # 删除日志路径
 LOG_FILE="./dedup_deleted.log"
 
-# 状态目录与文件，用于断点续跑
+# 状态目录与文件，用于缓存比对结果
 STATE_DIR="./.dedup_state"
-RECOVERED_MANIFEST="$STATE_DIR/recovered_manifest.txt"
-PROCESSED_LIST="$STATE_DIR/processed_recovered.txt"
+MATCH_RESULTS="$STATE_DIR/hash_matches.txt"
+DELETE_CANDIDATES="$STATE_DIR/delete_candidates.txt"
 
 # 模拟运行模式（dry run）设置为true不执行删除，只打印操作
 DRY_RUN=true
@@ -32,15 +34,7 @@ SIMILARITY_THRESHOLD=90
 ### === 辅助函数 === ###
 function ensure_state_dir() {
   mkdir -p "$STATE_DIR"
-  [[ -f "$PROCESSED_LIST" ]] || : > "$PROCESSED_LIST"
-}
-
-function load_processed_count() {
-  if [[ -f "$PROCESSED_LIST" ]]; then
-    wc -l < "$PROCESSED_LIST"
-  else
-    echo 0
-  fi
+  : > "$DELETE_CANDIDATES"
 }
 
 function log_progress() {
@@ -51,67 +45,55 @@ function log_progress() {
 }
 
 ### === 核心逻辑 === ###
-# 生成原始目录的ssdeep哈希索引（如已存在则跳过）
-function index_original_files() {
-  if [[ -f "$ORIGINAL_HASHES" ]]; then
-    echo "[*] 检测到已有索引，跳过重新生成：$ORIGINAL_HASHES"
+# 为指定目录生成 ssdeep 哈希索引（如已存在则跳过）
+function build_hash_index() {
+  local directory="$1"
+  local output_file="$2"
+  local label="$3"
+
+  if [[ -f "$output_file" ]]; then
+    echo "[*] 检测到已有${label}索引，跳过重新生成：$output_file"
     return
   fi
 
-  echo "[*] 正在索引原始文件目录：$ORIGINAL_DIR"
-  > "$ORIGINAL_HASHES"
-  find "$ORIGINAL_DIR" -type f -print0 | while IFS= read -r -d '' file; do
-    ssdeep -b "$file" >> "$ORIGINAL_HASHES"
+  echo "[*] 正在索引${label}目录：$directory"
+  > "$output_file"
+  find "$directory" -type f -print0 | while IFS= read -r -d '' file; do
+    ssdeep -b "$file" >> "$output_file"
   done
-  echo "[*] 索引完成，保存于 $ORIGINAL_HASHES"
+  echo "[*] ${label}索引完成，保存于 $output_file"
 }
 
-# 从 ssdeep 输出中提取相似度与匹配路径
+# 从 ssdeep 输出中提取相似度与匹配路径（兼容 -k 输出，尽量宽松）
 function parse_ssdeep_output() {
   local line="$1"
-  local score match_path
+  local score original_path recovered_path
 
-  # 兼容 "xxx(99)" 或 "99, path" 等多种输出格式
-  score=$(echo "$line" | grep -oE '[0-9]{1,3}(?=[)%]*)' | tail -n1 || true)
+  # 解析相似度：优先提取括号内的数字，其次提取百分数或逗号分隔的首字段
+  score=$(echo "$line" | grep -oE '\([0-9]{1,3}\)' | tr -d '()' | tail -n1 || true)
+  if [[ -z "$score" ]]; then
+    score=$(echo "$line" | grep -oE '[0-9]{1,3}(?=%)' | tail -n1 || true)
+  fi
   if [[ -z "$score" ]]; then
     score=$(echo "$line" | awk -F"," '{gsub(/[^0-9]/,"", $1); if($1!="") print $1}' | head -n1)
   fi
 
-  match_path=$(echo "$line" | awk -F"," 'NF>1 {sub(/^[[:space:]]*/, "", $2); print $2}')
-  if [[ -z "$match_path" ]]; then
-    match_path=$(echo "$line" | sed -E 's/.*:([^:()]+)\([0-9]{1,3}\).*/\1/' || true)
+  # 抽取左右路径，兼容 "pathA matches pathB (score)" 或 "hash,pathA matches hash,pathB: score" 等格式
+  local before after
+  before=$(echo "$line" | awk -F"matches" 'NF>1 {print $1}' | sed 's/[[:space:]]*$//')
+  after=$(echo "$line" | awk -F"matches" 'NF>1 {print $2}' | sed 's/^[[:space:]]*//')
+
+  if [[ -n "$before" ]]; then
+    original_path=$(echo "$before" | awk -F"," '{print $NF}' | sed 's/^ *//;s/ *$//')
   fi
 
-  if [[ -n "$score" && -n "$match_path" ]]; then
-    echo "$score|$match_path"
-  fi
-}
-
-# 比对单个恢复文件是否重复
-function is_duplicate_file() {
-  local file="$1"
-  local matches
-
-  if ! matches=$(ssdeep -b -m "$ORIGINAL_HASHES" "$file" 2>/dev/null | tail -n +2); then
-    return 1
+  if [[ -n "$after" ]]; then
+    recovered_path=$(echo "$after" | sed -E 's/[[:space:]]*\([0-9]{1,3}\).*//' | awk -F"," '{print $NF}' | sed 's/^ *//;s/ *$//')
   fi
 
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    local parsed
-    parsed=$(parse_ssdeep_output "$line")
-    if [[ -n "$parsed" ]]; then
-      local score match_path
-      score=$(echo "$parsed" | cut -d'|' -f1)
-      match_path=$(echo "$parsed" | cut -d'|' -f2-)
-      if [[ -n "$score" && $score =~ ^[0-9]+$ && $score -ge $SIMILARITY_THRESHOLD ]]; then
-        echo "$score|$match_path"
-        return 0
-      fi
-    fi
-  done <<< "$matches"
-
-  return 1
+  if [[ -n "$score" && -n "$recovered_path" && -n "$original_path" ]]; then
+    echo "$score|$original_path|$recovered_path"
+  fi
 }
 
 # 删除重复文件并写日志
@@ -127,44 +109,53 @@ function delete_file() {
   fi
 }
 
-# 生成/加载恢复文件清单，便于断点续跑
-function build_manifest() {
-  if [[ -f "$RECOVERED_MANIFEST" ]]; then
-    echo "[*] 继续使用已有清单：$RECOVERED_MANIFEST"
+# 通过 hash 列表批量比对，生成删除候选列表
+function collect_deletion_candidates() {
+  echo "[*] 正在执行批量比对（利用 ssdeep -k，加速处理）..."
+  if ! ssdeep -k "$ORIGINAL_HASHES" "$RECOVERED_HASHES" > "$MATCH_RESULTS" 2>/dev/null; then
+    echo "[!] ssdeep -k 执行失败，请确认 ssdeep 版本支持该参数。" >&2
+    return 1
+  fi
+
+  > "$DELETE_CANDIDATES"
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local parsed
+    parsed=$(parse_ssdeep_output "$line")
+    [[ -z "$parsed" ]] && continue
+
+    local score original_path recovered_path
+    score=$(echo "$parsed" | cut -d'|' -f1)
+    original_path=$(echo "$parsed" | cut -d'|' -f2)
+    recovered_path=$(echo "$parsed" | cut -d'|' -f3-)
+
+    if [[ -n "$score" && $score =~ ^[0-9]+$ && $score -ge $SIMILARITY_THRESHOLD ]]; then
+      echo "$recovered_path|原始文件: $original_path 相似度: ${score}%" >> "$DELETE_CANDIDATES"
+    fi
+  done < "$MATCH_RESULTS"
+
+  local total_candidates
+  total_candidates=$(wc -l < "$DELETE_CANDIDATES")
+  echo "[*] 生成删除候选: $total_candidates 条"
+}
+
+# 记录删除日志并执行删除（集中处理，避免逐个调用）
+function apply_deletions() {
+  if [[ ! -s "$DELETE_CANDIDATES" ]]; then
+    echo "[*] 未发现需要删除的重复文件"
     return
   fi
 
-  echo "[*] 正在生成恢复文件清单：$RECOVERED_MANIFEST"
-  find "$RECOVERED_DIR" -type f -print0 | sort -z | tr '\0' '\n' > "$RECOVERED_MANIFEST"
-}
+  local total processed
+  total=$(wc -l < "$DELETE_CANDIDATES")
+  processed=0
 
-# 扫描恢复目录进行去重，支持断点续跑
-function scan_recovered_files() {
-  build_manifest
-
-  local total processed start_line
-  total=$(wc -l < "$RECOVERED_MANIFEST")
-  processed=$(load_processed_count)
-  start_line=$((processed + 1))
-
-  echo "[*] 即将从第 $start_line 行开始处理 (已完成 $processed / $total)"
-
-  tail -n +"$start_line" "$RECOVERED_MANIFEST" | while IFS= read -r recfile; do
-    [[ -z "$recfile" ]] && continue
-    local result
-    result=$(is_duplicate_file "$recfile" || true)
-    if [[ -n "$result" ]]; then
-      local score match_path
-      score=$(echo "$result" | cut -d'|' -f1)
-      match_path=$(echo "$result" | cut -d'|' -f2-)
-      delete_file "$recfile" "原始文件: $match_path 相似度: ${score}%"
-    fi
-
-    # 记录进度，支持续跑
-    echo "$recfile" >> "$PROCESSED_LIST"
+  while IFS='|' read -r file reason; do
+    [[ -z "$file" ]] && continue
+    delete_file "$file" "$reason"
     processed=$((processed + 1))
     log_progress "$processed" "$total"
-  done
+  done < "$DELETE_CANDIDATES"
 }
 
 ### === 主流程 === ###
@@ -178,10 +169,16 @@ echo "[*] 模式: $( [[ "$DRY_RUN" == true ]] && echo "模拟运行" || echo "�
 echo "[*] 删除日志: $LOG_FILE"
 
 echo "[*] 开始准备原始文件索引..."
-index_original_files
+build_hash_index "$ORIGINAL_DIR" "$ORIGINAL_HASHES" "原始文件"
+build_hash_index "$RECOVERED_DIR" "$RECOVERED_HASHES" "恢复文件"
 
-echo "[*] 开始扫描去重..."
-scan_recovered_files
+echo "[*] 开始批量比对并生成删除列表..."
+if collect_deletion_candidates; then
+  echo "[*] 开始集中删除重复项..."
+  apply_deletions
+else
+  echo "[!] 比对失败，未执行删除"
+fi
 
 echo "=== 去重完成 ==="
 echo "日志路径: $LOG_FILE"
