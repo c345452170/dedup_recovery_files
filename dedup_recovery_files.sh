@@ -23,6 +23,7 @@ LOG_FILE="./dedup_deleted.log"
 # 状态目录与文件，用于缓存比对结果
 STATE_DIR="./.dedup_state"
 MATCH_RESULTS="$STATE_DIR/hash_matches.txt"
+COMPARE_PROGRESS="$STATE_DIR/compare_progress.txt"
 DELETE_CANDIDATES="$STATE_DIR/delete_candidates.txt"
 
 # 模拟运行模式（dry run）设置为true不执行删除，只打印操作
@@ -34,14 +35,22 @@ SIMILARITY_THRESHOLD=90
 ### === 辅助函数 === ###
 function ensure_state_dir() {
   mkdir -p "$STATE_DIR"
-  : > "$DELETE_CANDIDATES"
 }
 
 function log_progress() {
-  local processed total
+  local processed total prefix
   processed="$1"
   total="$2"
-  echo "[进度] 已处理: $processed / $total 文件" >&2
+  prefix="${3:-进度}"
+
+  local percent
+  if [[ "$total" -gt 0 ]]; then
+    percent=$((processed * 100 / total))
+  else
+    percent=0
+  fi
+
+  echo "[${prefix}] 已处理: $processed / $total (${percent}%)" >&2
 }
 
 ### === 核心逻辑 === ###
@@ -112,17 +121,37 @@ function delete_file() {
 # 通过 hash 列表批量比对，生成删除候选列表
 function collect_deletion_candidates() {
   echo "[*] 正在执行批量比对（利用 ssdeep -k，加速处理）..."
-  if ! ssdeep -k "$ORIGINAL_HASHES" "$RECOVERED_HASHES" > "$MATCH_RESULTS" 2>/dev/null; then
-    echo "[!] ssdeep -k 执行失败，请确认 ssdeep 版本支持该参数。" >&2
-    return 1
+  if [[ ! -s "$MATCH_RESULTS" ]]; then
+    if ! ssdeep -k "$ORIGINAL_HASHES" "$RECOVERED_HASHES" > "$MATCH_RESULTS" 2>/dev/null; then
+      echo "[!] ssdeep -k 执行失败，请确认 ssdeep 版本支持该参数。" >&2
+      return 1
+    fi
+  else
+    echo "[*] 检测到已有比对输出，使用缓存结果进行解析。"
   fi
 
-  > "$DELETE_CANDIDATES"
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
+  local total_lines start_line processed_lines
+  total_lines=$(wc -l < "$MATCH_RESULTS")
+  start_line=1
+  processed_lines=0
+
+  if [[ -f "$COMPARE_PROGRESS" ]]; then
+    start_line=$(( $(cat "$COMPARE_PROGRESS") + 1 ))
+    processed_lines=$((start_line - 1))
+    echo "[*] 继续上次进度，从第 $start_line 行开始解析（总计 $total_lines 行）。"
+  else
+    echo "[*] 开始解析比对结果，总计 $total_lines 行。"
+    > "$DELETE_CANDIDATES"
+  fi
+
+  tail -n +"$start_line" "$MATCH_RESULTS" | while IFS= read -r line; do
+    [[ -z "$line" ]] && { processed_lines=$((processed_lines + 1)); echo "$processed_lines" > "$COMPARE_PROGRESS"; log_progress "$processed_lines" "$total_lines" "比对进度"; continue; }
     local parsed
     parsed=$(parse_ssdeep_output "$line")
-    [[ -z "$parsed" ]] && continue
+    processed_lines=$((processed_lines + 1))
+    echo "$processed_lines" > "$COMPARE_PROGRESS"
+
+    [[ -z "$parsed" ]] && { log_progress "$processed_lines" "$total_lines" "比对进度"; continue; }
 
     local score original_path recovered_path
     score=$(echo "$parsed" | cut -d'|' -f1)
@@ -132,7 +161,11 @@ function collect_deletion_candidates() {
     if [[ -n "$score" && $score =~ ^[0-9]+$ && $score -ge $SIMILARITY_THRESHOLD ]]; then
       echo "$recovered_path|原始文件: $original_path 相似度: ${score}%" >> "$DELETE_CANDIDATES"
     fi
-  done < "$MATCH_RESULTS"
+
+    log_progress "$processed_lines" "$total_lines" "比对进度"
+  done
+
+  rm -f "$COMPARE_PROGRESS"
 
   local total_candidates
   total_candidates=$(wc -l < "$DELETE_CANDIDATES")
@@ -154,7 +187,7 @@ function apply_deletions() {
     [[ -z "$file" ]] && continue
     delete_file "$file" "$reason"
     processed=$((processed + 1))
-    log_progress "$processed" "$total"
+    log_progress "$processed" "$total" "删除进度"
   done < "$DELETE_CANDIDATES"
 }
 
